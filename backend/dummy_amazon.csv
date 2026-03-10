@@ -1,0 +1,6 @@
+sentiments,cleaned_review,cleaned_review_length,review_score
+positive,"This product is absolutely amazing, I use it every single day and it changed my life.",82,5
+negative,"Terrible quality, broke within the first week of using it. Do not recommend.",75,1
+neutral,"It works fine for the price, nothing special but it gets the job done well enough.",84,3
+positive,"Exceeded my expectations! Will be buying more for my family.",60,5
+negative,"Customer service was awful and the product is defective.",56,1
