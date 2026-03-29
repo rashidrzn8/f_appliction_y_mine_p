@@ -154,6 +154,7 @@ class ClassificationService:
 
         try:
             # ── Preprocess ──────────────────────────────────
+            text = str(text)
             sequence        = resources['tokenizer'].texts_to_sequences([text])
             padded_sequence = pad_sequences(sequence, maxlen=max_len, padding='post')
 
@@ -197,6 +198,150 @@ class ClassificationService:
     #  ON-DEMAND TRAINING
     # ──────────────────────────────────────────────────────────
     def train_model(self, csv_path: str, domain: str) -> dict:
+    """
+    Train a lightweight classification model from a CSV file and
+    save + load it under the given domain name.
+
+    CSV must contain a text column and a label column.
+    Column names are auto-detected using common naming conventions.
+    """
+    try:
+        import pandas as pd
+        from sklearn.preprocessing import LabelEncoder
+        from sklearn.model_selection import train_test_split
+        from sklearn.utils.class_weight import compute_class_weight
+        from tensorflow.keras.preprocessing.text import Tokenizer
+        from tensorflow.keras.models import Sequential
+        from tensorflow.keras.layers import Embedding, GlobalAveragePooling1D, Dense, Dropout
+        from tensorflow.keras.callbacks import EarlyStopping
+
+        print(f"\n[ClassificationService] Training domain '{domain}' with: {csv_path}")
+        df = pd.read_csv(csv_path)
+        df.columns = df.columns.astype(str).str.lower().str.strip()
+
+        # ── Auto-detect text column ──────────────────────
+        text_col_candidates  = ['text', 'title', 'tweet', 'sentence', 'document',
+                                 'body', 'content', 'review', 'message']
+        label_col_candidates = ['label', 'class', 'category', 'tag',
+                                 'target', 'sentiment', 'topic']
+
+        text_col  = next((c for c in text_col_candidates  if c in df.columns), None)
+        label_col = next((c for c in label_col_candidates if c in df.columns), None)
+
+        # Fallback heuristic
+        if not text_col or not label_col:
+            print("  Falling back to heuristic column detection...")
+            string_cols = df.select_dtypes(include=['object', 'string']).columns.tolist()
+            if len(string_cols) < 2:
+                string_cols = df.columns.tolist()
+
+            if len(string_cols) >= 2:
+                avg_lengths = {col: df[col].astype(str).str.len().mean() for col in string_cols}
+                text_col    = max(avg_lengths, key=avg_lengths.__getitem__)
+                string_cols.remove(text_col)
+                unique_counts = {col: df[col].nunique() for col in string_cols}
+                label_col     = min(unique_counts, key=unique_counts.__getitem__)
+
+        if not text_col or not label_col:
+            return {
+                "error": (
+                    f"Could not auto-detect text/label columns. "
+                    f"Found: {list(df.columns)}. "
+                    f"Please rename your columns to 'text' and 'label'."
+                )
+            }
+
+        print(f"  Text column: '{text_col}' | Label column: '{label_col}'")
+
+        # ── CLEAN & PREPROCESS TEXT & LABELS ─────────────
+        # Fill NaN and remove empty rows
+        df[text_col] = df[text_col].fillna('').astype(str)
+        df = df[df[text_col].str.strip() != '']
+
+        df[label_col] = df[label_col].fillna('').astype(str)
+        df = df[df[label_col].str.strip() != '']
+
+        texts = df[text_col].tolist()
+        labels = df[label_col].tolist()
+
+        # ── Encode labels ────────────────────────────────
+        encoder = LabelEncoder()
+        y       = encoder.fit_transform(labels)
+        num_classes = len(encoder.classes_)
+        print(f"  Classes ({num_classes}): {list(encoder.classes_)}")
+
+        # ── Tokenise ─────────────────────────────────────
+        max_words = 10000
+        max_len   = self.DEFAULT_MAX_LEN
+        tokenizer = Tokenizer(num_words=max_words, oov_token='<OOV>')
+        tokenizer.fit_on_texts(texts)
+        sequences = tokenizer.texts_to_sequences(texts)
+        X = pad_sequences(sequences, maxlen=max_len, padding='post')
+
+        # ── Train / val split ────────────────────────────
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.15, stratify=y, random_state=42
+        )
+
+        # ── Class weights ────────────────────────────────
+        cw_array = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+        cw_dict  = dict(enumerate(cw_array))
+
+        # ── Build model ──────────────────────────────────
+        model = Sequential([
+            Embedding(input_dim=max_words, output_dim=32, input_length=max_len),
+            GlobalAveragePooling1D(),
+            Dense(64, activation='relu'),
+            Dropout(0.4),
+            Dense(num_classes, activation='softmax')
+        ])
+        model.compile(
+            optimizer='adam',
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy']
+        )
+
+        # ── Train ────────────────────────────────────────
+        early_stop = EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
+        model.fit(
+            X_train, y_train,
+            epochs=15,
+            batch_size=32,
+            validation_data=(X_val, y_val),
+            class_weight=cw_dict,
+            callbacks=[early_stop],
+            verbose=1
+        )
+
+        # ── Save artefacts ───────────────────────────────
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        prefix = "" if domain == "base" else f"_{domain}"
+
+        model_path   = os.path.join(current_dir, f'model{prefix}.h5')
+        tok_path     = os.path.join(current_dir, f'tokenizer{prefix}.pkl')
+        enc_path     = os.path.join(current_dir, f'label_encoder{prefix}.pkl')
+
+        model.save(model_path)
+        with open(tok_path, 'wb') as f:
+            pickle.dump(tokenizer, f)
+        with open(enc_path, 'wb') as f:
+            pickle.dump(encoder, f)
+
+        print(f"  Saved: {model_path}")
+
+        # ── Load into memory ─────────────────────────────
+        self.load_resources(domain)
+
+        return {
+            "message": f"Model trained and loaded for domain '{domain}'",
+            "domain":  domain,
+            "classes": list(encoder.classes_)
+        }
+
+    except Exception as e:
+        print(f"[ClassificationService] Training error: {e}")
+        return {"error": "Training failed", "details": str(e)}
+    # def train_model(self, csv_path: str, domain: str) -> dict:
         """
         Train a lightweight classification model from a CSV file and
         save + load it under the given domain name.
@@ -251,7 +396,7 @@ class ClassificationService:
                 }
 
             print(f"  Text column: '{text_col}' | Label column: '{label_col}'")
-            texts  = df[text_col].astype(str).tolist()
+            texts = df[text_col].astype(str).tolist()
             labels = df[label_col].astype(str).tolist()
 
             # ── Encode labels ────────────────────────────────
